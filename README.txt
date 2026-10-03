@@ -176,7 +176,10 @@ Get-AppxPackage AppleInc.iTunes | Select-Object -ExpandProperty InstallLocation
 резервную копию перед финальным переносом в отдельном процессе AirTraffic.
 
 Скрипт не скачивает пакеты или DLL; интернет нужен только для зависимостей.
-IMSI не выводится в консоль, но есть в копиях и журналах: не публикуйте runs.
+IMSI не выводится в консоль. В журналах iPhone (commcenter.log, device.log)
+IMSI и ICCID заменены на <imsi> и <iccid>, телефоны на <num>, имя телефона на
+iPhone; журналы прошлых версий так не маскировались. В zip-архивах в runs
+(копии каталога, media-leftovers) IMSI есть: не публикуйте их.
 Папка runs уже исключена в .gitignore. Свою папку (--runs ПАПКА) внутри
 клона репозитория исключите сами, например строкой /wifi-runs/ в
 .git/info/exclude: скрипт правила git не меняет.
