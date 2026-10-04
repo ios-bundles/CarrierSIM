@@ -712,6 +712,35 @@ async def carrier_rows(device):
     return rows
 
 
+async def cloud_backup(device):
+    # iCloud Backup starts once the phone is locked, charging (a cable to the computer counts) and on Wi-Fi,
+    # about a day after the last one; its Books plug-in then rewrites Books/Books.plist mid-stage (issue #44).
+    from pymobiledevice3.exceptions import MissingValueError
+    try:
+        values = await device.get_value(domain='com.apple.mobile.backup') or {}
+    except MissingValueError:
+        return None
+    if not values.get('CloudBackupEnabled'):
+        return None
+    last = values.get('LastCloudBackupDate')
+    if isinstance(last, (int, float)):  # seconds since 2001-01-01 UTC
+        last = datetime.fromtimestamp(978307200 + last).astimezone().isoformat(timespec='minutes')
+    elif isinstance(last, datetime):
+        last = last.astimezone().isoformat(timespec='minutes')
+    return {'enabled': True, 'last': last if isinstance(last, str) else None}
+
+
+def backup_warning(backup, now=None):
+    if not backup:
+        return None
+    text = '  Включена резервная копия iCloud'
+    if backup.get('last'):
+        hours = ((now or datetime.now().astimezone()) - datetime.fromisoformat(backup['last'])).total_seconds() / 3600
+        text += f' (последняя {hours:.0f} ч назад)' if hours >= 1 else ' (последняя меньше часа назад)'
+    return (text + '. Держите iPhone разблокированным до конца операции: на зарядке '
+            'с погасшим экраном iOS может начать копию и переписать служебные файлы Books.')
+
+
 async def device_info(device):
     result = {k: await device.get_value(key=k) for k in
               ('ProductType', 'HardwareModel', 'ProductVersion', 'BuildVersion', 'ActivationState',
@@ -719,6 +748,7 @@ async def device_info(device):
     rows = await carrier_rows(device)
     result['carriers'] = [{k: r[k] for k in ('MCC', 'MNC', 'Slot', 'CFBundleIdentifier', 'CFBundleVersion') if k in r}
                           for r in rows]
+    result['cloud_backup'] = await cloud_backup(device)
     return result
 
 
@@ -2062,6 +2092,7 @@ async def execute(args,assets):
         output_section('ВЫПОЛНЕНИЕ')
         print('  Копии и журнал:\n    '+str(run),flush=True)
         print('\n  Не отключайте iPhone до завершения операции.',flush=True)
+        if warning := backup_warning(info.get('cloud_backup')): print(warning,flush=True)
         save_json(run/'device.json',{**info,'udid_hash':digest(udid.encode())})
         trigger=None
         plmns={str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows}

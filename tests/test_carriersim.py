@@ -652,6 +652,29 @@ class LogStreamTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(loop.time() - started, 5)
 
 
+class CloudBackupTest(unittest.TestCase):
+    @staticmethod
+    def device(values):
+        return SimpleNamespace(get_value=AsyncMock(return_value=values))
+
+    def test_reads_last_backup_from_lockdown(self):
+        # Values read from an iPhone 16 Pro Max / iOS 27.0.1: the backup ended 2026-10-04 11:41:53 UTC.
+        backup = asyncio.run(carrier.cloud_backup(self.device(
+            {'CloudBackupEnabled': True, 'LastCloudBackupDate': 812806913, 'LastCloudBackupTZ': 'GMT+3'})))
+        self.assertEqual(carrier.datetime.fromisoformat(backup['last']).timestamp(), 1791114060)
+        now = carrier.datetime.fromisoformat('2026-10-04T22:42+03:00')
+        self.assertIn('последняя 8 ч назад', carrier.backup_warning(backup, now))
+        self.assertIn('Держите iPhone разблокированным', carrier.backup_warning({'enabled': True, 'last': None}))
+
+    def test_disabled_or_missing_backup_prints_nothing(self):
+        from pymobiledevice3.exceptions import MissingValueError
+        self.assertIsNone(asyncio.run(carrier.cloud_backup(self.device({'CloudBackupEnabled': False}))))
+        self.assertIsNone(asyncio.run(carrier.cloud_backup(self.device({}))))
+        missing = SimpleNamespace(get_value=AsyncMock(side_effect=MissingValueError('MissingValue', 'x', '27.0.1')))
+        self.assertIsNone(asyncio.run(carrier.cloud_backup(missing)))
+        self.assertIsNone(carrier.backup_warning(None))
+
+
 class DiagnoseTest(unittest.TestCase):
     # Lines from a real CommCenter log (iPhone 16 Pro Max, iOS 27.0.1, MegaFon, airplane mode on and off).
     IKE_LINES = [
