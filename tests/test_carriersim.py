@@ -673,6 +673,17 @@ class DiagnoseTest(unittest.TestCase):
         self.assertIn('Connected → Disconnected', report)
         self.assertIn('код 2: FailedToSend: delete reply', report)
 
+    def test_epdg_stub_address_is_named_as_dns_block(self):
+        # Field report from 4pda: ePDG 127.0.0.1, IKE Connecting -> Disconnected, Transport error 49.
+        state = {}; collect = carrier.diag_collect(state)
+        line = 'Cancelling client 1 for <NEIKEv2Transport> UDP 192.168.1.5:500 -> 127.0.0.1:500'
+        collect(self.entry(line), line)
+        report = carrier.diag_report(state, [{'Slot': 'kOne', 'MCC': '250', 'MNC': '20'}])
+        self.assertIn('127.0.0.1 — заглушка', report)
+        self.assertEqual(carrier.epdg_text('0.0.0.0')[:9], '0.0.0.0 —')
+        self.assertEqual(carrier.epdg_text('85.26.231.145'), '85.26.231.145')
+        self.assertEqual(carrier.epdg_text('epdg.example'), 'epdg.example')
+
     def test_settles_only_after_every_sim_registered_again_after_the_drop(self):
         rows = [{'Slot': 'kOne'}, {'Slot': 'kTwo'}]
         reg = 'ImsRegistrationState: UE is Registered for Voice+Sms on kLTE (CarrierBundle)'
