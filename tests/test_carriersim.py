@@ -283,6 +283,47 @@ class SimsTest(unittest.TestCase):
         self.assertEqual(carrier.mask_phone(None), 'номер недоступен')
         self.assertNotIn('250011234567890', carrier.mask_log('IMSI 250011234567890'))
 
+    def test_syslog_capture_masks_identifiers_before_disk(self):
+        rows = [b'Oct  3 02:33:42 Ivan-Petrov-iPhone CommCenter[109] <Notice>: Returning bundle match: Matches: '
+                b'[Name: /var/mobile/Library/Carrier Bundles/iPhone/250019999999999, Score: 59.00]',
+                b'Oct  3 02:33:42 Ivan-Petrov-iPhone CommCenter[109] <Notice>: persona:89701012345678901234 '
+                b'old link 257029876543210 tel +7 (999) 123-45-67 at 2026-09-30 16:04:55+0300',
+                b'Oct  3 02:33:42 Ivan-Petrov-iPhone CommCenter[109] <Notice>: Frequency: 955000000, '
+                b'bands 0x00ff12345678901234ff, ../airlift-src-ce9b03ba8772252928d2/q0',
+                b'Oct  3 02:33:42 Ivan-Petrov-iPhone wifid[50] <Notice>: 250019999999999']
+        class Syslog:
+            def __init__(self, device): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *exc): return False
+            async def watch(self):
+                for row in rows: yield row
+                written.set()
+                await asyncio.Event().wait()
+        async def run(path):
+            nonlocal written
+            written = asyncio.Event()
+            async with carrier.syslog_capture(None, path, lambda line: 'CommCenter' in line, linger=0):
+                await asyncio.wait_for(written.wait(), 5)
+        written = None
+        rows_device = [dict(Slot='kOne', InternationalMobileSubscriberIdentity='250019999999999',
+                            IntegratedCircuitCardIdentity='89701012345678901234')]
+        device = SimpleNamespace(get_value=AsyncMock(return_value=rows_device))
+        with tempfile.TemporaryDirectory() as root, \
+                patch.dict(carrier.LOG_SECRETS, clear=True), \
+                patch('pymobiledevice3.services.syslog.SyslogService', Syslog):
+            asyncio.run(carrier.carrier_rows(device))
+            path = pathlib.Path(root) / 'commcenter.log'
+            asyncio.run(run(path))
+            text = path.read_text(encoding='utf-8')
+        self.assertIn('Carrier Bundles/iPhone/<imsi>, Score: 59.00', text)
+        self.assertIn('persona:<iccid> old link <num> tel <num> at 2026-09-30 16:04:55+0300', text)
+        self.assertIn('Frequency: 955000000, bands 0x00ff12345678901234ff, ../airlift-src-ce9b03ba8772252928d2/q0',
+                      text)
+        self.assertIn('Oct  3 02:33:42 iPhone CommCenter[109]', text)
+        for secret in ('250019999999999', '257029876543210', '8970101', 'Ivan', '999) 123'):
+            self.assertNotIn(secret, text)
+        self.assertNotIn('wifid', text)
+
     def test_codec_answer_is_not_confused_with_offer(self):
         answer = 'm=audio 100 RTP/AVP 96 101\na=rtpmap:96 EVS/16000\na=rtpmap:101 telephone-event/8000'
         self.assertEqual(carrier.sip_answer_codec(answer), 'EVS/16000')

@@ -30,6 +30,8 @@ ROOT = SELF.parent
 
 PARENT = '/var/mobile/Library/Carrier Bundles'
 DEVICE_FAMILY = 'iPhone'
+# IMSI/ICCID of the phone's SIMs, filled by carrier_rows: masked exactly in every log line.
+LOG_SECRETS = {}
 TARGET = PARENT + '/' + DEVICE_FAMILY
 SYSTEM_BUNDLE_DIR = 'System/Library/Carrier Bundles/' + DEVICE_FAMILY
 PAYLOAD_PATH = 'q0/q1/q2/q3/q4/payload'
@@ -494,6 +496,7 @@ DEVICE_LOG_KEYS = ('atc', 'airtraffic', 'book', 'sandbox', 'deny', 'airlift', 'c
 async def syslog_capture(device, path, keep, status=None, linger=1):
     # Diagnostics only: a slow, broken or overflowing syslog never fails the operation.
     # Its error goes into the log file and, when given, status['log_error'].
+    # Lines are masked before disk: user bundle links are named by IMSI, and these logs get attached to issues.
     from pymobiledevice3.services.syslog import SyslogService
     ready = asyncio.Event()
     async def watch():
@@ -505,6 +508,8 @@ async def syslog_capture(device, path, keep, status=None, linger=1):
                     async for row in log.watch():
                         line = row.decode(errors='replace') if isinstance(row, bytes) else row
                         if keep(line):
+                            # The second field is the phone's name, often the owner's.
+                            line = mask_ids(re.sub(r'^(\w{3} +\d+ [\d:]+ )\S+ ', r'\1iPhone ', line))
                             size += len(line)
                             require(size <= 16 * 1024 * 1024, 'Log limit reached')
                             f.write(line + '\n'); f.flush()
@@ -514,7 +519,7 @@ async def syslog_capture(device, path, keep, status=None, linger=1):
             if status is not None:
                 status['log_error'] = error_line(error)
             with contextlib.suppress(Exception):
-                with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + repr(error) + '\n')
+                with path.open('a', encoding='utf-8') as f: f.write('LOG ERROR: ' + mask_ids(repr(error)) + '\n')
         finally:
             ready.set()
     task = asyncio.create_task(watch())
@@ -696,10 +701,15 @@ async def connect(udid):
 async def carrier_rows(device):
     from pymobiledevice3.exceptions import MissingValueError
     try:
-        return await device.get_value(key='CarrierBundleInfoArray') or []
+        rows = await device.get_value(key='CarrierBundleInfoArray') or []
     except MissingValueError:
         # Wi-Fi iPads do not expose this cellular-only lockdown key.
         return []
+    for row in rows:
+        for key, label in (('InternationalMobileSubscriberIdentity', '<imsi>'), ('IntegratedCircuitCardIdentity', '<iccid>')):
+            if re.fullmatch(r'\d{8,}', value := str(row.get(key, ''))):
+                LOG_SECRETS[value] = label
+    return rows
 
 
 async def device_info(device):
@@ -1555,6 +1565,14 @@ def sip_answer_codec(message):
 def mask_log(text):
     # Phone numbers, IMSI/ICCID and other long identifiers never reach disk or screen.
     return re.sub(r'\+?\d[\d ()-]{6,}\d', '<num>', text)
+
+
+def mask_ids(text):
+    # Raw syslog keeps its numbers (frequencies, TAC, hex dumps, airlift tokens): only the SIMs' own IMSI/ICCID,
+    # any other standalone 11+ digit number (IMSI links of earlier SIMs, phones) and +phones are masked.
+    for value, label in LOG_SECRETS.items():
+        text = text.replace(value, label)
+    return re.sub(r'(?<![\w.+-])\d{11,20}(?![\w.])|(?<!\d)\+\d[\d ()-]{6,}\d', '<num>', text)
 
 
 def log_slot(entry):
