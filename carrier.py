@@ -715,10 +715,11 @@ async def carrier_rows(device):
 async def cloud_backup(device):
     # iCloud Backup starts once the phone is locked, charging (a cable to the computer counts) and on Wi-Fi,
     # about a day after the last one; its Books plug-in then rewrites Books/Books.plist mid-stage (issue #44).
-    from pymobiledevice3.exceptions import MissingValueError
+    from pymobiledevice3.exceptions import LockdownError
     try:
         values = await device.get_value(domain='com.apple.mobile.backup') or {}
-    except MissingValueError:
+    except LockdownError:
+        # Missing or prohibited (MDM) domain: only a hint, never a reason to stop. A dropped link still raises.
         return None
     if not values.get('CloudBackupEnabled'):
         return None
@@ -726,7 +727,8 @@ async def cloud_backup(device):
     if isinstance(last, (int, float)):  # seconds since 2001-01-01 UTC
         last = datetime.fromtimestamp(978307200 + last).astimezone().isoformat(timespec='minutes')
     elif isinstance(last, datetime):
-        last = last.astimezone().isoformat(timespec='minutes')
+        # plistlib gives a naive datetime in UTC; astimezone() would take it for local time.
+        last = (last if last.tzinfo else last.replace(tzinfo=timezone.utc)).astimezone().isoformat(timespec='minutes')
     return {'enabled': True, 'last': last if isinstance(last, str) else None}
 
 
@@ -832,7 +834,7 @@ async def install_trigger(device, path, run):
 import ctypes as C
 import subprocess
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 APPLE_DIRS = []
 ASSET_SHA256 = '3b47408c5d2deb941d8b94c64724f5b72357dc39911ec9e77b7e4b3ccfb8659f'

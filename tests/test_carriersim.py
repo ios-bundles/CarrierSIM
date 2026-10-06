@@ -672,7 +672,20 @@ class CloudBackupTest(unittest.TestCase):
         self.assertIsNone(asyncio.run(carrier.cloud_backup(self.device({}))))
         missing = SimpleNamespace(get_value=AsyncMock(side_effect=MissingValueError('MissingValue', 'x', '27.0.1')))
         self.assertIsNone(asyncio.run(carrier.cloud_backup(missing)))
+        from pymobiledevice3.exceptions import ConnectionTerminatedError, GetProhibitedError
+        prohibited = SimpleNamespace(get_value=AsyncMock(side_effect=GetProhibitedError('GetProhibited', 'x', '27.0.1')))
+        self.assertIsNone(asyncio.run(carrier.cloud_backup(prohibited)))
+        # A dropped link is not a missing value: it stays an error the retry loop sees.
+        dropped = SimpleNamespace(get_value=AsyncMock(side_effect=ConnectionTerminatedError()))
+        with self.assertRaises(ConnectionTerminatedError):
+            asyncio.run(carrier.cloud_backup(dropped))
         self.assertIsNone(carrier.backup_warning(None))
+
+    def test_plist_date_is_utc(self):
+        # The same moment as a plist date: plistlib returns it naive, in UTC.
+        backup = asyncio.run(carrier.cloud_backup(self.device(
+            {'CloudBackupEnabled': True, 'LastCloudBackupDate': carrier.datetime(2026, 10, 4, 11, 41, 53)})))
+        self.assertEqual(carrier.datetime.fromisoformat(backup['last']).timestamp(), 1791114060)
 
 
 class DiagnoseTest(unittest.TestCase):
