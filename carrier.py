@@ -575,6 +575,35 @@ def grappa_failure(error, log):
     return None
 
 
+# iOS 27.2 beta 3 (24B5099f, #56): atc no longer moves a finished asset out of /var/mobile/Media, so
+# neither the export nor the write happens. Earlier 27.2 betas still worked.
+AIRLIFT_REFUSED = 'Failed to move completed file for asset'
+AIRLIFT_CLOSED_FROM = (27, 2)
+AIRLIFT_CLOSED_TEXT = ('iPhone не переносит файлы AirTraffic в каталог операторов: с iOS 27.2 beta 3 Apple закрыла '
+                       'способ, которым скрипт меняет настройки оператора, повтор не поможет. Уже установленный '
+                       'профиль остаётся.')
+
+
+def ios_version(info):
+    return tuple(int(n) for n in re.findall(r'\d+', str(info.get('ProductVersion', '')))[:2])
+
+
+def airlift_closed(info):
+    return ios_version(info) >= AIRLIFT_CLOSED_FROM
+
+
+def airlift_refused(log, source):
+    # Only this run's asset: a stale line about another run's folder says nothing about this one.
+    with contextlib.suppress(OSError):
+        return any(AIRLIFT_REFUSED in line and source in line
+                   for line in log.read_text(encoding='utf-8', errors='replace').splitlines())
+    return False
+
+
+class AirliftClosed(RuntimeError):
+    pass
+
+
 async def transfer(device, run, payload=None, expected=None, recovery=False):
     from pymobiledevice3.services.afc import AfcService
     run.mkdir(parents=True, exist_ok=False)
@@ -673,6 +702,10 @@ async def transfer(device, run, payload=None, expected=None, recovery=False):
         except BaseException as error:
             journal['operation_error'] = error_text(error)
             save_json(run / 'journal.json', journal)
+            # Export or final move refused by atc: say so instead of a generic failure that invites retries.
+            if (isinstance(error, Exception) and not isinstance(error, (AirliftClosed, GrappaRefused))
+                    and airlift_refused(run / 'device.log', source)):
+                raise AirliftClosed(AIRLIFT_CLOSED_TEXT + ' Ошибка: ' + error_text(error)) from error
             raise
         finally:
             if mutated:
@@ -1322,9 +1355,35 @@ def transient_error(error):
     if isinstance(error,OSError) and error.errno in (32,54,60,104,110,50,51,64,65,
                                                      10050,10051,10054,10060,10064,10065):return True
     # The phone answering without our assets is deterministic: retrying only repeats it.
-    if isinstance(error,GrappaRefused):return False
+    if isinstance(error,(GrappaRefused,AirliftClosed)):return False
     return isinstance(error,RuntimeError) and any(t in str(error) for t in
         ('Сбой AirTraffic','Final source not consumed')) and 'не подтвердил нужные объекты' not in str(error)
+
+
+async def auto_recover(args,failed,before):
+    # A dropped connection must not leave the stage for menu 5: reconnect and recover again (#56).
+    for attempt in range(1,args.attempts+1):
+        device=await ready_device(args.udid,args.wait_seconds)
+        recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
+        recovery.mkdir(mode=0o700); save_environment(recovery)
+        try:
+            await recover_all(device,failed,recovery)
+            print('iPhone возвращён в исходное состояние.',flush=True)
+            return
+        except Exception as error:
+            if attempt==args.attempts or not transient_error(error):
+                print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
+                print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
+                raise
+            print('Связь прервалась во время восстановления, повторяю…',flush=True)
+        except BaseException:
+            print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
+            print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
+            raise
+        finally:await device.close()
+        await asyncio.sleep(2)
+        # A recovery step that failed is itself a stage: take it too, newest first, as --recover would.
+        failed=[p for p in pending(args.runs,args.udid) if args.recover or p not in before]
 
 
 async def execute_with_retry(args,assets):
@@ -1350,17 +1409,7 @@ async def execute_with_retry(args,assets):
             failed=[] if args.status or isinstance(error,LocalNetworkDenied) else [p for p in pending(args.runs,args.udid) if args.recover or p not in before]
             if failed:
                 print('Сбой во время записи. Сначала возвращаю iPhone в исходное состояние…',flush=True)
-                device=await ready_device(args.udid,args.wait_seconds)
-                recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
-                recovery.mkdir(mode=0o700); save_environment(recovery)
-                try:
-                    await recover_all(device,failed,recovery)
-                    print('iPhone возвращён в исходное состояние.',flush=True)
-                except BaseException:
-                    print('Автовосстановление не завершено. Журнал:',recovery,flush=True)
-                    print('Не удаляйте папку runs и '+recover_hint()+'.',flush=True)
-                    raise
-                finally:await device.close()
+                await auto_recover(args,failed,before)
             if attempt==args.attempts or not transient_error(error):raise
             print('Повторяю попытку…',flush=True)
             await asyncio.sleep(2)
@@ -2029,7 +2078,14 @@ async def execute(args,assets):
                 if catalog: print(flush=True)
                 for line in passport_lines(name,catalog): print(line,flush=True)
             if catalog: print(flush=True)
+        # Recovery stays allowed: a stage that never left Books needs only AFC.
+        closed=(airlift_closed(info) and not args.any_ios and not args.recover
+                and (bool(sims) or args.restore or args.restore_backup))
+        closed_text=(f"На iOS {info['ProductVersion']} запись не работает: с iOS 27.2 beta 3 Apple закрыла способ, "
+                     'которым скрипт меняет настройки оператора. Установка и удаление профиля не сработают, '
+                     'уже установленный профиль остаётся. Проверить всё равно: флаг --any-ios.')
         if args.status:
+            if closed: print('\n  Внимание: '+closed_text+'\n',flush=True)
             print('  Сейчас — профиль, который использует устройство.\n'
                   '  План — профиль для планируемой установки.\n\n'
                   '  Чтобы определить нужную SIM, сверьте последние 4 символа ICCID:\n'
@@ -2040,7 +2096,7 @@ async def execute(args,assets):
                 print('Внимание: прошлая операция на этом iPhone не завершилась, запись не начнётся. Сначала '
                       +recover_hint()+'.',flush=True)
             # The menu must not ask "write?" when the write would not start or has nothing to write.
-            if os.environ.get('CARRIERSIM_PLAN') and (blocked or not sims): return NOTHING_TO_WRITE
+            if os.environ.get('CARRIERSIM_PLAN') and (blocked or not sims or closed): return NOTHING_TO_WRITE
             return
         custom=None
         if args.trigger:
@@ -2057,6 +2113,7 @@ async def execute(args,assets):
         require(not unresolved or recover,
                 'Прошлая операция на этом iPhone не завершилась. Сначала '+recover_hint()+
                 ', затем повторите действие. Этап: '+str(unresolved[0] if unresolved else ''))
+        require(not closed,closed_text)
         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
         run.mkdir(mode=0o700); DIAG['run']=run; save_environment(run)
         output_section('ВЫПОЛНЕНИЕ')
@@ -2510,6 +2567,7 @@ def main():
                         help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию; '
                              'при установке all пропускает зарубежные SIM без своей строки в bundle.yaml)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
+    parser.add_argument('--any-ios',action='store_true',help='не останавливаться на iOS 27.2 и новее (для проверки: на 27.2 beta 3 запись не работает)')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
     parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose и --report (по умолчанию 90) или --watch-call (по умолчанию 180)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
