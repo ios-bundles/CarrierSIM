@@ -1127,6 +1127,186 @@ class LocalNetworkTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('recovered_by', carrier.read_json(folder / 'journal.json'))
 
 
+class AirliftClosedTest(unittest.IsolatedAsyncioTestCase):
+    # From the #56 log: iPhone 16e, iOS 27.2 beta 3 (24B5099f), export refused.
+    LINE = ('iPhone: atc(AirTraffic)[53] <Error>: Failed to move completed file for asset <ATAsset: 0x7873205e00>'
+            '[Sync Download, Book, EBook, id=../../airlift-src-5e4d2eed240231a22e76/../../Library/Carrier Bundles/iPhone, '
+            'syncid=(null), adamID=2\n')
+    ROW = {'Slot': 'kOne', 'MCC': '250', 'MNC': '02', 'InternationalMobileSubscriberIdentity': '250021234567890'}
+
+    def test_warning_skips_older_ios_and_the_27_2_betas_that_worked(self):
+        for version, build, warned in (('26.6.1', '23G83', False), ('27.0', '24A437', False), ('27.0.1', '24A446', False), ('27.0', '24A5430a', False), ('27.1.2', '24B80', False),
+                                       ('27', '', False), ('', '', False),
+                                       ('27.2', '24B5084k', False), ('27.2', '24B5089g', False),  # beta 1, beta 2
+                                       ('27.2', '24B5099f', True), ('27.2', '24B5112a', True),     # beta 3 and later
+                                       ('27.2', '24B83', True), ('27.2.1', '24B91', True), ('28.0', '25A100', True)):
+            with self.subTest(version=version, build=build):
+                self.assertEqual(carrier.airlift_may_be_closed({'ProductVersion': version, 'BuildVersion': build}), warned)
+
+    def test_refusal_is_found_only_for_this_runs_asset_and_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = pathlib.Path(temp) / 'device.log'
+            self.assertFalse(carrier.airlift_refused(log, 'airlift-src-5e4d2eed240231a22e76'))
+            log.write_text(self.LINE, encoding='utf-8')
+            self.assertTrue(carrier.airlift_refused(log, 'airlift-src-5e4d2eed240231a22e76'))
+            self.assertFalse(carrier.airlift_refused(log, 'airlift-src-0ceceb6a51535f684a9f'))
+        self.assertFalse(carrier.transient_error(carrier.AirliftClosed(carrier.AIRLIFT_CLOSED_TEXT)))
+
+    async def run_execute(self, version, build='24B5099f', **values):
+        device = AsyncMock()
+        device.get_value.side_effect = lambda key=None: [self.ROW] if key else {}
+        info = {'ProductType': 'iPhone17,5', 'HardwareModel': 'V59AP', 'ProductVersion': version,
+                'BuildVersion': build, 'ActivationState': 'Activated'}
+        args = SimpleNamespace(udid='test-device', wait_seconds=0, recover=None, status=False, restore=False,
+                               restore_backup=None, sims='all', bundles={'default': 'Vodafone_hu.bundle'},
+                               runs=self.runs, trigger=None)
+        args.__dict__.update(values)
+        with patch.object(carrier, 'ready_device', AsyncMock(return_value=device)), \
+             patch.object(carrier, 'device_info', AsyncMock(return_value=info)), \
+             patch.object(carrier, 'load_catalog', return_value=None), \
+             patch.object(carrier, 'transfer', AsyncMock()) as transfer, \
+             patch.object(carrier, 'install_trigger', AsyncMock()) as trigger, \
+             patch.object(carrier, 'save_environment', side_effect=RuntimeError('started')), \
+             patch.dict(carrier.DIAG, {}, clear=True), contextlib.redirect_stdout(io.StringIO()) as output:
+            try:
+                return await carrier.execute(args, {}), output.getvalue()
+            except RuntimeError as error:
+                return str(error), output.getvalue()
+            finally:
+                transfer.assert_not_awaited()
+                trigger.assert_not_awaited()
+
+    async def test_install_and_removal_only_warn_on_27_2_beta_3(self):
+        # The version never blocks: the stop comes from the refusal in the iPhone log.
+        with tempfile.TemporaryDirectory() as temp:
+            self.runs = pathlib.Path(temp)
+            for values in ({}, {'restore': True}):
+                with self.subTest(**values):
+                    result, output = await self.run_execute('27.2', **values)
+                    self.assertEqual(result, 'started')  # reached the operation folder
+                    self.assertIn('запись может не сработать', output)
+            result, output = await self.run_execute('27.2', build='24B5089g')
+            self.assertEqual(result, 'started')
+            self.assertNotIn('запись может не сработать', output)
+
+    async def test_status_warns_and_menu_still_offers_to_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.runs = pathlib.Path(temp)
+            code, output = await self.run_execute('27.2', status=True)
+            self.assertIn('запись может не сработать', output)
+            with patch.dict(carrier.os.environ, {'CARRIERSIM_PLAN': '1'}):
+                code, _ = await self.run_execute('27.2', status=True)
+            self.assertNotEqual(code, carrier.NOTHING_TO_WRITE)  # menu 7 still offers the write
+            code, output = await self.run_execute('27.0.1', status=True)
+            self.assertNotIn('запись может не сработать', output)
+
+    async def test_recovery_is_not_blocked(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.runs = pathlib.Path(temp)
+            code, output = await self.run_execute('27.2', recover=pathlib.Path('AUTO'))
+            self.assertEqual(code, 0)
+            self.assertIn('восстанавливать нечего', output)
+
+
+class AirliftRefusalTransferTest(unittest.IsolatedAsyncioTestCase):
+    # transfer() as on 27.2 beta 3 (#56): staging works, then atc refuses the export and logs it.
+    async def run_transfer(self, refused_source):
+        files = {}
+        afc = AsyncMock(); afc.__aenter__.return_value = afc
+        afc.listdir.return_value = []
+        afc.stat.return_value = {'st_ifmt': 'S_IFLNK', 'LinkTarget': '../../../' + carrier.PARENT[1:]}
+        afc.set_file_contents.side_effect = lambda path, data: files.__setitem__(path, data)
+        afc.get_file_contents.side_effect = lambda path: files[path]
+        service = AsyncMock(); service.recv_plist.return_value = {'Status': 'DataComplete'}
+        device = SimpleNamespace(udid='phone', start_lockdown_service=AsyncMock(return_value=service))
+
+        def snapshot(_, run):
+            carrier.save_json(run / 'books.json', {'existed': True, 'hash': carrier.tree_hash({}), 'top': []})
+            return {}, True
+
+        async def session(udid, assets, pause, run):
+            source = assets[0][0].split('/')[2]
+            (run / 'device.log').write_text(AirliftClosedTest.LINE.replace('airlift-src-5e4d2eed240231a22e76',
+                                            refused_source or source), encoding='utf-8')
+            await pause()  # the real export check: the exported catalog never appears
+
+        @contextlib.asynccontextmanager
+        async def quiet(*_):
+            yield
+
+        with tempfile.TemporaryDirectory() as temp, \
+             patch('pymobiledevice3.services.afc.AfcService', return_value=afc), \
+             patch.object(carrier, 'network_timeout', quiet), patch.object(carrier, 'device_log', quiet), \
+             patch.object(carrier, 'exists', AsyncMock(return_value=None)), \
+             patch.object(carrier, 'purge_stale_books', AsyncMock(return_value={})), \
+             patch.object(carrier, 'books_snapshot', AsyncMock(side_effect=snapshot)), \
+             patch.object(carrier, 'restore_books', AsyncMock(return_value=[])), \
+             patch.object(carrier, 'host_session', session), \
+             patch.object(carrier.asyncio, 'sleep', AsyncMock()):
+            run = pathlib.Path(temp) / 'snapshot'
+            try:
+                await carrier.transfer(device, run)
+            except Exception as error:
+                return error, carrier.read_json(run / 'journal.json')
+
+    async def test_refused_export_stops_as_airlift_closed_and_is_not_retried(self):
+        error, journal = await self.run_transfer(None)
+        self.assertIsInstance(error, carrier.AirliftClosed)
+        self.assertIn('Apple закрыла', str(error))
+        self.assertIn('не отдал текущие настройки', str(error))  # the original error is kept
+        self.assertIn('Каталог операторов на iPhone не менялся', str(error))
+        self.assertFalse(carrier.transient_error(error))
+        # Stopped at the export check: nothing left /var/mobile/Media, recovery needs Books only.
+        self.assertEqual(journal['phase'], 'export-check')
+        self.assertTrue(journal['books_restored'])
+
+    async def test_refusal_of_another_run_keeps_the_original_error(self):
+        error, _ = await self.run_transfer('airlift-src-0ceceb6a51535f684a9f')
+        self.assertNotIsInstance(error, carrier.AirliftClosed)
+        self.assertIn('не отдал текущие настройки', str(error))
+
+
+class AutoRecoverTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+        self.args = SimpleNamespace(udid='phone', wait_seconds=1, attempts=3, runs=self.root, recover=False)
+
+    async def run_case(self, errors, later):
+        devices = []
+        def ready(*_):
+            devices.append(SimpleNamespace(close=AsyncMock()))
+            return devices[-1]
+        with patch.object(carrier, 'ready_device', AsyncMock(side_effect=ready)), \
+             patch.object(carrier, 'recover_all', AsyncMock(side_effect=errors)) as recover, \
+             patch.object(carrier, 'pending', return_value=later), \
+             patch.object(carrier, 'save_environment'), \
+             patch.object(carrier.asyncio, 'sleep', AsyncMock()), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            try:
+                await carrier.auto_recover(self.args, [self.root / 'stage'], [self.root / 'old'])
+            finally:
+                for device in devices: device.close.assert_awaited_once()
+        return recover, output.getvalue()
+
+    async def test_dropped_connection_reconnects_and_takes_the_failed_recovery_stage_too(self):
+        from pymobiledevice3.exceptions import ConnectionTerminatedError
+        stage, step, old = self.root / 'stage', self.root / 'step', self.root / 'old'
+        recover, output = await self.run_case([ConnectionTerminatedError(), None], [old, stage, step])
+        self.assertEqual(recover.await_count, 2)
+        self.assertEqual(recover.await_args_list[1].args[1], [stage, step])
+        # Each try gets its own folder: transfer() refuses to reuse one.
+        self.assertNotEqual(recover.await_args_list[0].args[2], recover.await_args_list[1].args[2])
+        self.assertIn('возвращён в исходное состояние', output)
+
+    async def test_permanent_error_stops_at_once(self):
+        with self.assertRaisesRegex(RuntimeError, 'повреждена'):
+            recover, _ = await self.run_case([RuntimeError('Копия Books повреждена.')], [])
+        with self.assertRaises(ConnectionResetError):
+            await self.run_case([ConnectionResetError(54, 'reset')] * 3, [self.root / 'stage'])
+
+
 class VersionTest(unittest.TestCase):
     def test_cli_version_and_help_work_without_apple_services(self):
         for flag, expected in (('--version', f'CarrierSIM {VERSION}'), ('--help', '--recover')):
