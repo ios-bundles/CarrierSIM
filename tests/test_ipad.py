@@ -78,13 +78,16 @@ class IpadTest(unittest.IsolatedAsyncioTestCase):
     async def test_wifi_ipad_missing_carrier_key_is_empty(self):
         from pymobiledevice3.exceptions import MissingValueError
         device = AsyncMock()
-        async def get_value(key=None):
+        async def get_value(key=None, domain=None):
+            if domain:
+                return {}
             if key == 'CarrierBundleInfoArray':
                 raise MissingValueError('MissingValue', 'test-device', '27.0.1')
             return self.info.get(key)
         device.get_value.side_effect = get_value
         info = await carrier.device_info(device)
         self.assertEqual(info['carriers'], [])
+        self.assertIsNone(info['cloud_backup'])
         self.assertFalse(info['TelephonyCapability'])
         self.assertEqual(await carrier.carrier_rows(device), [])
         device.get_value.side_effect = ConnectionError('USB disconnected')
