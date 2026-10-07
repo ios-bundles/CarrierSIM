@@ -7,6 +7,7 @@ import contextlib
 import functools
 import hashlib
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -1740,6 +1741,18 @@ def sim_header(row):
     return f"{SLOT_NAMES[row['Slot']]}  ·  {row.get('MCC', '')}{row.get('MNC', '')}"
 
 
+def epdg_text(address):
+    # A loopback or 0.0.0.0 gateway never reaches the operator: a DNS filter answered for the ePDG name.
+    try:
+        ip = ipaddress.ip_address(address.strip('[]'))
+    except ValueError:
+        return address
+    if ip.is_loopback or ip.is_unspecified:
+        return (f'{address} — заглушка, а не адрес оператора: обычно так имя ePDG закрывает DNS '
+                '(роутер, фильтр рекламы, VPN или оператор)')
+    return address
+
+
 def diag_report(state, rows):
     yes = lambda v: {'true':'да','false':'нет','kTrue':'да','kFalse':'нет'}.get(v, v)
     rat = lambda v: v and {'kRatGSM':'2G (GSM)','kRatUMTS':'3G (UMTS)','kRatLTE':'4G (LTE)','kRatNR':'5G (NR)'}.get(v, v)
@@ -1772,7 +1785,7 @@ def diag_report(state, rows):
             ('5G SA', g('sa') and (g('sa') == 'enabled' and 'включён' or f"выключен ({g('sa',1) or 'причина не указана'})")),
             ('Звонок через', g('call_access')),
             ('Кодек звонка', g('codec') and CODEC_NAMES.get(g('codec'), g('codec'))),
-            ('ePDG', g('epdg')),
+            ('ePDG', g('epdg') and epdg_text(g('epdg'))),
             ('IKE с ePDG', g('ike_state') and f"{g('ike_state')} → {g('ike_state',1)}"),
             ('Ошибка IKE', g('ike_error') and f"код {g('ike_error')}: {g('ike_error',1)}"),
         ]
